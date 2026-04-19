@@ -4,7 +4,7 @@ AMD + FVG Signal Bot
 - Pulls live candle data directly from Deriv API
 - Runs AMD + FVG logic on every closed candle
 - Sends Entry / SL / TP to Telegram for manual trading
-- Tiny HTTP server on the side so Render detects an open port
+- Staggered connections so Deriv does not rate-limit
 """
 
 import asyncio
@@ -28,15 +28,20 @@ DERIV_API_TOKEN  = os.environ.get("DERIV_API_TOKEN", "")
 PORT             = int(os.environ.get("PORT", 10000))
 
 # ── Symbols to watch ─────────────────────────────────
+# Format: (deriv_symbol, display_name, granularity_seconds, label)
 SYMBOLS = [
     ("cryETHUSD", "ETH/USD", 3600, "1H"),
     ("cryBTCUSD", "BTC/USD", 3600, "1H"),
     ("frxEURUSD", "EUR/USD", 3600, "1H"),
-    ("frxXAUUSD", "XAU/USD", 3600, "1H"),
-    ("frxXAGUSD", "XAG/USD", 3600, "1H"),
-    ("frxXPTUSD", "XPT/USD", 3600, "1H"),
-    ("frxXPDUSD", "XPD/USD", 3600, "1H"),
+    ("frxXAUUSD", "XAU/USD", 3600, "1H"),   # Gold
+    ("frxXAGUSD", "XAG/USD", 3600, "1H"),   # Silver
+    ("frxXPTUSD", "XPT/USD", 3600, "1H"),   # Platinum
+    ("frxXPDUSD", "XPD/USD", 3600, "1H"),   # Palladium
 ]
+
+# Seconds to wait between starting each symbol stream
+# Prevents Deriv from rejecting simultaneous connections
+CONNECT_STAGGER = 4
 
 # ── AMD + FVG parameters ─────────────────────────────
 ACC_LEN      = 20
@@ -52,25 +57,32 @@ DERIV_WS = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 bot_status = {
     "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-    "symbols": {},
+    "symbols": {name: "⏳ Waiting..." for _, name, _, _ in SYMBOLS},
 }
+
+startup_results = {}
+startup_lock    = asyncio.Lock()
 
 
 # ══════════════════════════════════════════════════════
-#  HEALTH CHECK SERVER  (satisfies Render port check)
+#  HEALTH CHECK SERVER
 # ══════════════════════════════════════════════════════
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = (
-            "<h2>AMD + FVG Bot Running</h2>"
-            f"<p>Started: {bot_status['started_at']}</p><ul>"
+        rows = "".join(
+            f"<tr><td><b>{sym}</b></td><td>{info}</td></tr>"
+            for sym, info in bot_status["symbols"].items()
         )
-        for sym, info in bot_status["symbols"].items():
-            body += f"<li><b>{sym}</b>: {info}</li>"
-        body += "</ul>"
-        body = body.encode()
+        body = (
+            f"<!DOCTYPE html><html>"
+            f"<head><meta charset='UTF-8'><title>AMD Bot</title></head><body>"
+            f"<h2>AMD + FVG Bot</h2>"
+            f"<p>Started: {bot_status['started_at']}</p>"
+            f"<table border=1 cellpadding=8>{rows}</table>"
+            f"</body></html>"
+        ).encode("utf-8")
         self.send_response(200)
-        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -104,6 +116,31 @@ def send_telegram(msg: str):
         print(f"[Telegram] Error: {e}")
 
 
+async def send_startup_report(name: str, result: str):
+    """Collects each symbol result. Sends one combined Telegram message when all are in."""
+    async with startup_lock:
+        startup_results[name] = result
+
+        if len(startup_results) == len(SYMBOLS):
+            ts    = datetime.now(timezone.utc).strftime("%Y-%m-%d  %H:%M UTC")
+            lines = []
+            for _, n, _, tf in SYMBOLS:
+                res = startup_results.get(n, "unknown")
+                icon = "✅" if res == "ok" else "❌"
+                detail = f"({tf})" if res == "ok" else f"— {res}"
+                lines.append(f"  {icon} {n}  {detail}")
+
+            msg = (
+                f"🤖 <b>AMD Bot Online</b>\n"
+                f"━━━━━━━━━━━━━━━━━\n"
+                f"<b>Watching:</b>\n"
+                + "\n".join(lines) +
+                f"\n━━━━━━━━━━━━━━━━━\n"
+                f"🕐 {ts}"
+            )
+            send_telegram(msg)
+
+
 # ══════════════════════════════════════════════════════
 #  AMD + FVG DETECTOR
 # ══════════════════════════════════════════════════════
@@ -114,7 +151,7 @@ class AMDDetector:
         self.phase    = 0
         self.a_hi     = None
         self.a_lo     = None
-        self.man_dir  = 0
+        self.man_dir  = 0    # 0=none  1=bullish  -1=bearish
         self.man_ex   = None
         self.m_bar    = 0
         self.cooldown = 0
@@ -258,12 +295,19 @@ def fire_signal(sig: dict, name: str, tf: str):
 
 
 # ══════════════════════════════════════════════════════
-#  DERIV STREAM
+#  DERIV STREAM — one task per symbol
 # ══════════════════════════════════════════════════════
-async def stream_symbol(sym: str, name: str, gran: int, tf: str):
-    detector    = AMDDetector()
-    initialized = False
-    bot_status["symbols"][name] = "Connecting..."
+async def stream_symbol(sym: str, name: str, gran: int, tf: str, delay: int):
+    # Stagger startup so Deriv doesn't reject simultaneous connections
+    if delay > 0:
+        print(f"[{name}] Waiting {delay}s before connecting...")
+        await asyncio.sleep(delay)
+
+    detector         = AMDDetector()
+    initialized      = False
+    startup_reported = False
+
+    bot_status["symbols"][name] = "⏳ Connecting..."
     print(f"[{name}] Starting {tf} stream...")
 
     while True:
@@ -274,9 +318,14 @@ async def stream_symbol(sym: str, name: str, gran: int, tf: str):
                     await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
                     auth = json.loads(await ws.recv())
                     if "error" in auth:
-                        print(f"[{name}] Auth error: {auth['error']['message']}")
-                    else:
-                        print(f"[{name}] Authorized")
+                        err_msg = auth["error"]["message"]
+                        print(f"[{name}] Auth error: {err_msg}")
+                        bot_status["symbols"][name] = f"❌ Auth: {err_msg}"
+                        if not startup_reported:
+                            startup_reported = True
+                            await send_startup_report(name, f"auth error: {err_msg}")
+                        await asyncio.sleep(30)
+                        continue
 
                 await ws.send(json.dumps({
                     "ticks_history":     sym,
@@ -295,7 +344,18 @@ async def stream_symbol(sym: str, name: str, gran: int, tf: str):
                     data     = json.loads(raw)
                     msg_type = data.get("msg_type")
 
-                    if msg_type == "candles":
+                    # Deriv returned an error (e.g. invalid symbol)
+                    if "error" in data and msg_type not in ("ohlc",):
+                        err_msg = data["error"].get("message", str(data["error"]))
+                        print(f"[{name}] Symbol error: {err_msg}")
+                        bot_status["symbols"][name] = f"❌ {err_msg}"
+                        if not startup_reported:
+                            startup_reported = True
+                            await send_startup_report(name, err_msg)
+                        break   # reconnect loop will retry
+
+                    # History batch received
+                    elif msg_type == "candles":
                         hist = data.get("candles", [])
                         for c in hist[:-1]:
                             detector.update({
@@ -317,14 +377,13 @@ async def stream_symbol(sym: str, name: str, gran: int, tf: str):
                             }
                         initialized = True
                         ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
-                        bot_status["symbols"][name] = f"Live — {len(hist)} candles at {ts}"
+                        bot_status["symbols"][name] = f"✅ Live — {len(hist)} candles at {ts}"
                         print(f"[{name}] Ready — {len(hist)} candles at {ts}")
-                        send_telegram(
-                            f"🤖 <b>AMD Bot Online</b>\n"
-                            f"📊 Watching <b>{name}</b>  ({tf})\n"
-                            f"🕐 {ts}"
-                        )
+                        if not startup_reported:
+                            startup_reported = True
+                            await send_startup_report(name, "ok")
 
+                    # Live tick
                     elif msg_type == "ohlc":
                         ohlc      = data.get("ohlc", {})
                         open_time = int(ohlc.get("open_time", 0))
@@ -340,9 +399,10 @@ async def stream_symbol(sym: str, name: str, gran: int, tf: str):
                             current_open_time = open_time
                             current_candle    = new_candle
                         elif open_time != current_open_time:
+                            # Previous candle just closed — scan it
                             if initialized and current_candle is not None:
                                 ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
-                                bot_status["symbols"][name] = f"Scanning... last close {ts}"
+                                bot_status["symbols"][name] = f"🔍 Scanning... last close {ts}"
                                 sig = detector.update(current_candle)
                                 if sig:
                                     fire_signal(sig, name, tf)
@@ -351,16 +411,13 @@ async def stream_symbol(sym: str, name: str, gran: int, tf: str):
                         else:
                             current_candle = new_candle
 
-                    elif "error" in data:
-                        print(f"[{name}] Deriv error: {data['error'].get('message', data)}")
-
         except websockets.exceptions.ConnectionClosed as e:
             print(f"[{name}] Disconnected ({e}) — reconnecting in 5s...")
-            bot_status["symbols"][name] = "Reconnecting..."
+            bot_status["symbols"][name] = "⚠️ Reconnecting..."
             initialized = False
         except Exception as e:
             print(f"[{name}] Error: {e} — reconnecting in 5s...")
-            bot_status["symbols"][name] = f"Error: {e}"
+            bot_status["symbols"][name] = f"⚠️ Error: {e}"
             initialized = False
 
         await asyncio.sleep(5)
@@ -379,13 +436,13 @@ async def main():
     if missing:
         print(f"WARNING: Missing env vars: {', '.join(missing)}")
 
-    # Start the tiny HTTP health server in a daemon thread
     threading.Thread(target=run_health_server, daemon=True).start()
 
-    # Run all symbol streams concurrently forever
+    # Launch each symbol with a staggered delay so Deriv
+    # doesn't reject simultaneous connection requests
     await asyncio.gather(*[
-        stream_symbol(sym, name, gran, tf)
-        for sym, name, gran, tf in SYMBOLS
+        stream_symbol(sym, name, gran, tf, delay=i * CONNECT_STAGGER)
+        for i, (sym, name, gran, tf) in enumerate(SYMBOLS)
     ])
 
 
