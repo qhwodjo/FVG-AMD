@@ -31,6 +31,11 @@ PORT             = int(os.environ.get("PORT", 10000))
 SYMBOLS = [
     ("cryETHUSD", "ETH/USD", 3600, "1H"),
     ("cryBTCUSD", "BTC/USD", 3600, "1H"),
+    ("frxEURUSD", "EUR/USD", 3600, "1H"),
+    ("frxXAUUSD", "XAU/USD", 3600, "1H"),
+    ("frxXAGUSD", "XAG/USD", 3600, "1H"),
+    ("frxXPTUSD", "XPT/USD", 3600, "1H"),
+    ("frxXPDUSD", "XPD/USD", 3600, "1H"),
 ]
 
 # ── AMD + FVG parameters ─────────────────────────────
