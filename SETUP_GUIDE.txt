@@ -1,0 +1,144 @@
+══════════════════════════════════════════════
+  AMD + FVG Bot  —  Setup Guide
+══════════════════════════════════════════════
+
+No TradingView needed. The bot connects directly
+to Deriv, runs the AMD+FVG logic, and sends
+signals to your Telegram.
+
+
+── STEP 1: Create Telegram Bot ───────────────
+
+1. Open Telegram → search @BotFather → START
+2. Send:  /newbot
+3. Pick any name and username
+4. BotFather gives you a TOKEN — save it
+   Looks like:  7123456789:AAHdqTcvCH...
+
+5. Get your Chat ID:
+   - Search @userinfobot → START
+   - It replies with your ID number
+   - Save it  (e.g. 123456789)
+
+
+── STEP 2: Get Deriv App ID ──────────────────
+
+Option A (quick): Use the default app_id=1089
+  → Works for market data, no account needed
+
+Option B (recommended for reliability):
+1. Go to https://api.deriv.com/
+2. Register a free app → get your own App ID
+3. Use that as DERIV_APP_ID env var
+
+If you want the bot to access your account data:
+1. Go to app.deriv.com → Settings → API Token
+2. Create token with "Read" permission only
+   (we are NOT auto-trading, just reading prices)
+3. Save as DERIV_API_TOKEN
+
+
+── STEP 3: Upload to GitHub ──────────────────
+
+1. Go to https://github.com → New repository
+   Name: amd-signal-bot  (private is fine)
+
+2. Upload these 3 files:
+   - main.py
+   - requirements.txt
+   - Procfile
+
+
+── STEP 4: Deploy on Render ──────────────────
+
+1. Go to https://render.com → Sign up free
+2. Click "New +" → Background Worker
+   (NOT Web Service — this runs 24/7 silently)
+
+3. Connect GitHub → select your repo
+
+4. Settings:
+   - Name:           amd-signal-bot
+   - Runtime:        Python 3
+   - Build Command:  pip install -r requirements.txt
+   - Start Command:  python main.py
+
+5. Environment Variables — add these:
+   ┌────────────────────┬─────────────────────────────┐
+   │ TELEGRAM_TOKEN     │ your BotFather token        │
+   │ TELEGRAM_CHAT_ID   │ your chat ID number         │
+   │ DERIV_APP_ID       │ 1089  (or your own)         │
+   │ DERIV_API_TOKEN    │ (optional, leave blank)     │
+   └────────────────────┴─────────────────────────────┘
+
+6. Click "Create Background Worker"
+   Render will install packages and start the bot.
+
+7. Check the logs — you should see:
+   [ETH/USD] Ready — 300 candles loaded at 14:00 UTC
+
+8. Check Telegram — you should get a message:
+   🤖 AMD Bot Online
+   📊 Watching ETH/USD (1H)
+
+
+── STEP 5: Change Symbols / Timeframe ────────
+
+Edit the SYMBOLS list in main.py:
+
+SYMBOLS = [
+    ("cryETHUSD", "ETH/USD",  3600, "1H"),   # 1 Hour
+    ("cryBTCUSD", "BTC/USD",  3600, "1H"),
+    ("frxEURUSD", "EUR/USD",  3600, "1H"),
+    ("frxXAUUSD", "XAU/USD",  3600, "1H"),
+]
+
+Granularity options:
+  60    = 1 minute
+  300   = 5 minutes
+  900   = 15 minutes
+  3600  = 1 hour      ← recommended
+  14400 = 4 hours
+  86400 = 1 day
+
+
+── What a Signal Looks Like ──────────────────
+
+🔴 AMD + FVG Signal
+━━━━━━━━━━━━━━━━━
+📊 Pair:      ETH/USD
+⏱ Timeframe: 1H
+📣 Signal:    SELL  (Short)
+━━━━━━━━━━━━━━━━━
+🎯 Entry  →  2347.50
+🛑 SL     →  2398.20  (50.70)
+✅ TP     →  2245.80  (101.70)
+━━━━━━━━━━━━━━━━━
+⚖️  RR  1 : 2.0
+━━━━━━━━━━━━━━━━━
+🕐 2026-04-18  14:00 UTC
+
+Then you go to Deriv manually and place the trade
+using those exact levels.
+
+
+── Adjusting Sensitivity ─────────────────────
+
+In main.py, tweak these values:
+
+ACC_LEN      = 20    ↑ more bars = stricter accumulation
+ACC_MAX_PCT  = 0.30  ↓ lower % = tighter range needed
+MAN_LOOK     = 25    bars to find manip after accum
+ATR_SL_MULT  = 1.5   ↑ wider stop loss
+RRR          = 2.0   ↑ higher TP target
+
+
+── Keeping It Running (Free Tier Note) ───────
+
+Render's free "Background Worker" runs 24/7
+with no sleep — unlike the free Web Service.
+You get 750 hours/month free which covers 1 bot.
+
+To run more symbols, either add them all to
+SYMBOLS in one bot (recommended), or upgrade
+to Render's $7/month paid plan.
